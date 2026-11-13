@@ -43,7 +43,7 @@ The stage order puts tests and security checks before the release artifact is bu
 3. Set **Script Path** to one of:
    - `jenkins-pipeline/Jenkinsfile.declarative`
    - `jenkins-pipeline/Jenkinsfile.scripted`
-4. Configure a Linux agent labelled `linux`. Change `agent { label 'linux' }` or `node('linux')` if your agent label differs.
+4. Both pipelines use `agent any` / `node`, so they can run on any available executor, including the built-in Jenkins node. For production isolation, provision a dedicated Linux agent and replace these with `agent { label 'linux' }` and `node('linux')`.
 5. Configure SCM webhooks so branch and tag events trigger builds.
 
 ### Required Jenkins plugins
@@ -69,7 +69,7 @@ Update these IDs in both Jenkinsfiles if your Jenkins uses different names.
 
 ### Agent prerequisites
 
-The Linux agent must provide:
+The executor used by the pipelines must provide:
 
 - Python 3.12 with `venv`
 - Git and Bash
