@@ -14,6 +14,7 @@ Windows and macOS archives are currently produced by `.github/workflows/build.ym
 | Stage | What happens | Tooling |
 |---|---|---|
 | Checkout | Clean workspace and fetch source | Git |
+| Prepare Agent | Build the local Docker agent image and verify Python | Docker |
 | Dependencies | Create a clean venv and install pinned-range dependencies | `venv`, `pip` |
 | Code Quality | Lint and byte-compile source | Ruff, `compileall` |
 | Unit Tests | Run the full test suite with coverage | pytest, pytest-cov |
@@ -31,8 +32,8 @@ The stage order puts tests and security checks before the release artifact is bu
 
 ## Branch and tag behavior
 
-- Pull requests and feature branches: checkout, dependencies, quality, tests, and scans only.
-- `main`: additionally publishes the artifact to `s3://<bucket>/staging/<build-number>/`.
+- Pull requests and feature branches: checkout, agent preparation, dependencies, quality, tests, and scans only.
+- `main`: same validation path; publishing is intentionally skipped.
 - `v*` tags: publish, request approval, deploy to production, smoke-test, and monitor.
 - The tag must match the application version. For example, `VERSION = "1.0.0"` requires tag `v1.0.0`.
 
@@ -43,44 +44,49 @@ The stage order puts tests and security checks before the release artifact is bu
 3. Set **Script Path** to one of:
    - `jenkins-pipeline/Jenkinsfile.declarative`
    - `jenkins-pipeline/Jenkinsfile.scripted`
-4. Both pipelines use `agent any` / `node`, so they can run on any available executor, including the built-in Jenkins node. For production isolation, provision a dedicated Linux agent and replace these with `agent { label 'linux' }` and `node('linux')`.
+4. Both pipelines run on the built-in node with `agent any` / `node`; all build work executes inside the Docker agent image. The controller needs the Docker CLI and access to the Docker socket.
 5. Configure SCM webhooks so branch and tag events trigger builds.
+
+### Docker agent
+
+`Dockerfile.agent` builds a self-contained Linux agent with Python 3.12, Git, Bash, `zip`/`unzip`, AWS CLI v1, Trivy, SonarScanner, and the Qt runtime libraries needed for the headless smoke test. `agent-run.sh` translates the Jenkins workspace path to the Docker host path and runs each stage in that image as the Jenkins uid/gid.
+
+The pipeline builds `book-my-date/jenkins-agent:1.0.0` automatically when the image is missing. To force a rebuild after changing `Dockerfile.agent`, remove the image or change `JENKINS_AGENT_IMAGE` in both Jenkinsfiles. The Docker build context is `jenkins-pipeline/`, so rebuilds use Docker's layer cache after the first run.
 
 ### Required Jenkins plugins
 
 - Pipeline
+- Git
 - Credentials Binding
-- AWS Credentials
-- SonarQube Scanner
-- Sonar Quality Gates
 - JUnit
 - Workspace Cleanup
 - Timestamper
+
+The AWS Credentials, SonarQube Scanner, and Sonar Quality Gates plugins are not required. AWS credentials use the standard username/password binding, and the quality gate is checked directly through the SonarQube API.
 
 ### Credentials and access
 
 | ID / name | Type | Purpose |
 |---|---|---|
-| `aws-release` | AWS Credentials | S3 publish/deploy, ECR access if added later, CloudWatch metrics |
-| `SonarQube` | SonarQube server | Scanner endpoint and quality gate |
+| `aws-release` | Username with password | S3 publish/deploy and CloudWatch metrics; username is the access key ID, password is the secret access key |
+| `sonar-token` | Secret text | SonarQube token used by `sonar-scanner` and the quality-gate API check |
 | `release-managers` | Jenkins group | Users allowed to approve production deployment |
 
-Update these IDs in both Jenkinsfiles if your Jenkins uses different names.
+Update these IDs in both Jenkinsfiles if your Jenkins uses different names. If your AWS account requires temporary credentials, add a session-token binding and pass `AWS_SESSION_TOKEN` through `agent-run.sh`.
 
 ### Agent prerequisites
 
-The executor used by the pipelines must provide:
+The Jenkins controller must provide:
 
-- Python 3.12 with `venv`
+- Docker CLI access to the Docker daemon
 - Git and Bash
-- `zip` / `unzip`
-- AWS CLI v2
-- Trivy
-- SonarScanner
-- Qt runtime libraries needed by the packaged smoke test:
-  - `libegl1`
-  - `libxkbcommon-x11-0`
-  - `libxcb-cursor0`
+- Network access to Docker Hub, GitHub releases, SonarSource binaries, PyPI, and the configured S3/SonarQube endpoints
+
+The agent image provides Python 3.12 with `venv`, AWS CLI v1, Trivy, SonarScanner, `zip`/`unzip`, and the Qt runtime libraries needed by the packaged smoke test:
+
+- `libegl1`
+- `libxkbcommon-x11-0`
+- `libxcb-cursor0`
 
 The smoke test runs with `QT_QPA_PLATFORM=offscreen`, so no X server is required.
 
@@ -142,9 +148,11 @@ Both use dimensions `Version` and `Environment=production`. The Monitoring stage
 Both pipelines expose:
 
 - `RUN_SECURITY_SCANS` — toggles pip-audit and Trivy. Default: enabled.
-- `RUN_SONAR` — toggles SonarQube analysis and the quality gate. Default: enabled.
+- `RUN_SONAR` — toggles SonarQube analysis when a host URL is configured. Default: enabled.
+- `SONAR_HOST_URL` — SonarQube base URL, for example `https://sonar.example.com`. Default: empty, which skips SonarQube.
+- `SONAR_CREDENTIALS_ID` — Jenkins secret-text credential ID for the SonarQube token. Default: `sonar-token`.
 
-Disable a parameter only for an explicitly diagnosed emergency; production releases should keep both enabled.
+Disable security scans only for an explicitly diagnosed emergency; production releases should keep them enabled. The SonarQube stage is skipped until `SONAR_HOST_URL` is set, so the pipeline can run before SonarQube is provisioned.
 
 ## Local validation
 
@@ -152,6 +160,8 @@ Disable a parameter only for an explicitly diagnosed emergency; production relea
 .venv/bin/python -m ruff check .
 .venv/bin/python -m pytest tests -q
 .venv/bin/python packaging/build.py
+python3 -m py_compile jenkins-pipeline/check-quality-gate.py
+bash -n jenkins-pipeline/agent-run.sh
 ```
 
 The Jenkins pipelines install dependencies from `requirements.txt` and `requirements-dev.txt`; add pytest, pytest-cov, and pip-audit there when maintaining the CI contract.
