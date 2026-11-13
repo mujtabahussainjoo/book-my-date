@@ -1,0 +1,374 @@
+pipeline {
+    agent { label 'linux' }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        booleanParam(
+            name: 'RUN_SECURITY_SCANS',
+            defaultValue: true,
+            description: 'Run pip-audit and Trivy vulnerability/secret scans.'
+        )
+        booleanParam(
+            name: 'RUN_SONAR',
+            defaultValue: true,
+            description: 'Run SonarQube analysis and enforce its quality gate.'
+        )
+    }
+
+    environment {
+        VENV_DIR = '.venv-ci'
+        S3_BUCKET = 'book-my-date-releases'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        AWS_CREDENTIALS_ID = 'aws-release'
+        SONAR_SERVER = 'SonarQube'
+        SONAR_SETTINGS = 'jenkins-pipeline/sonar-project.properties'
+        QT_QPA_PLATFORM = 'offscreen'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir()
+                checkout scm
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    echo "Building ${GIT_COMMIT:-unknown} from ${GIT_BRANCH:-detached HEAD}"
+                    git rev-parse HEAD
+                '''
+            }
+        }
+
+        stage('Dependencies') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    mkdir -p artifacts junit coverage security
+                    python3 --version
+                    python3 -m venv --clear "$VENV_DIR"
+                    . "$VENV_DIR/bin/activate"
+                    python -m pip install --upgrade pip setuptools wheel
+                    python -m pip install -r requirements.txt -r requirements-dev.txt
+                    python -m pip check
+                    python -m pip freeze | tee artifacts/pip-freeze.txt
+                '''
+            }
+        }
+
+        stage('Code Quality') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    . "$VENV_DIR/bin/activate"
+                    python -m ruff check .
+                    python -m compileall -q book_my_date installer launcher.py packaging
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    . "$VENV_DIR/bin/activate"
+                    python -m pytest tests -q \
+                        --junitxml=junit/unit.xml \
+                        --cov=book_my_date \
+                        --cov=installer \
+                        --cov-report=xml:coverage/coverage.xml \
+                        --cov-report=term-missing
+                '''
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    . "$VENV_DIR/bin/activate"
+                    python -m pytest \
+                        tests/test_wizard.py \
+                        tests/test_database.py \
+                        tests/test_reminders.py \
+                        -q \
+                        --junitxml=junit/integration.xml
+                '''
+            }
+        }
+
+        stage('Security Checks') {
+            when {
+                expression { return params.RUN_SECURITY_SCANS }
+            }
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    . "$VENV_DIR/bin/activate"
+                    command -v trivy >/dev/null 2>&1 || {
+                        echo "ERROR: trivy is required on the Jenkins agent."
+                        exit 1
+                    }
+
+                    set +e
+                    pip-audit -r requirements.txt 2>&1 | tee security/pip-audit.txt
+                    AUDIT_STATUS=${PIPESTATUS[0]}
+                    trivy fs \
+                        --scanners vuln,secret \
+                        --severity HIGH,CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code 1 \
+                        --skip-dirs .git \
+                        --skip-dirs .venv-ci \
+                        --skip-dirs release \
+                        --skip-dirs packaging/build \
+                        --skip-dirs packaging/dist \
+                        --format table \
+                        . 2>&1 | tee security/trivy.txt
+                    TRIVY_STATUS=${PIPESTATUS[0]}
+                    set -e
+
+                    if [ "$AUDIT_STATUS" -ne 0 ] || [ "$TRIVY_STATUS" -ne 0 ]; then
+                        echo "Security gate failed: pip-audit=$AUDIT_STATUS trivy=$TRIVY_STATUS"
+                        exit 1
+                    fi
+                '''
+            }
+        }
+
+        stage('Quality Gate') {
+            when {
+                expression { return params.RUN_SONAR }
+            }
+            steps {
+                withSonarQubeEnv(env.SONAR_SERVER) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        VERSION=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' book_my_date/config.py)
+                        sonar-scanner \
+                            -Dproject.settings="$SONAR_SETTINGS" \
+                            -Dsonar.projectVersion="$VERSION"
+                    '''
+                }
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    . "$VENV_DIR/bin/activate"
+                    VERSION=$(python -c "from book_my_date.config import VERSION; print(VERSION)")
+
+                    if [ -n "${TAG_NAME:-}" ] && [ "v${VERSION}" != "$TAG_NAME" ]; then
+                        echo "ERROR: tag $TAG_NAME does not match application version v$VERSION"
+                        exit 1
+                    fi
+
+                    python packaging/build.py
+                    mkdir -p release/wheels
+                    python -m pip wheel . --no-deps --wheel-dir release/wheels
+
+                    ARCHIVE=$(find release -maxdepth 1 -name '*.zip' -print -quit)
+                    test -n "$ARCHIVE" || {
+                        echo "ERROR: native release archive was not created."
+                        exit 1
+                    }
+                    printf '%s\n' "$VERSION" > release/version.txt
+                    (
+                        cd release
+                        sha256sum "$(basename "$ARCHIVE")" > "$(basename "$ARCHIVE").sha256"
+                    )
+                    echo "Built version $VERSION: $(basename "$ARCHIVE")"
+                '''
+            }
+        }
+
+        stage('Publish') {
+            when {
+                beforeAgent true
+                anyOf {
+                    branch 'main'
+                    tag 'v*'
+                }
+            }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CREDENTIALS_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        VERSION=$(cat release/version.txt)
+                        ARCHIVE=$(find release -maxdepth 1 -name '*.zip' -print -quit)
+                        BASE=$(basename "$ARCHIVE")
+                        DEST="s3://${S3_BUCKET}/staging/${BUILD_NUMBER}"
+
+                        aws s3 cp "$ARCHIVE" "${DEST}/${BASE}"
+                        aws s3 cp "${ARCHIVE}.sha256" "${DEST}/${BASE}.sha256"
+                        aws s3 cp release/version.txt "${DEST}/version.txt"
+                        aws s3 cp release/wheels/ "${DEST}/wheels/" --recursive
+                        echo "Published staging artifact for v${VERSION} to ${DEST}"
+                    '''
+                }
+            }
+        }
+
+        stage('Approval') {
+            when {
+                beforeAgent true
+                tag 'v*'
+            }
+            steps {
+                timeout(time: 2, unit: 'HOURS') {
+                    input(
+                        message: "Deploy ${env.TAG_NAME} to the production release bucket?",
+                        ok: 'Deploy',
+                        submitter: 'release-managers'
+                    )
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                beforeAgent true
+                tag 'v*'
+            }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CREDENTIALS_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        VERSION=$(cat release/version.txt)
+                        SRC="s3://${S3_BUCKET}/staging/${BUILD_NUMBER}/"
+                        DEST="s3://${S3_BUCKET}/releases/${VERSION}/"
+
+                        aws s3 cp "$SRC" "$DEST" --recursive
+                        aws s3api head-object \
+                            --bucket "$S3_BUCKET" \
+                            --key "releases/${VERSION}/version.txt" >/dev/null
+                        echo "Deployed v${VERSION} to ${DEST}"
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            when {
+                beforeAgent true
+                tag 'v*'
+            }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CREDENTIALS_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        VERSION=$(cat release/version.txt)
+                        ARCHIVE=$(find release -maxdepth 1 -name '*.zip' -exec basename {} \;)
+
+                        rm -rf smoke
+                        mkdir smoke
+                        cd smoke
+                        aws s3 cp "s3://${S3_BUCKET}/releases/${VERSION}/${ARCHIVE}" .
+                        aws s3 cp "s3://${S3_BUCKET}/releases/${VERSION}/${ARCHIVE}.sha256" .
+                        sha256sum -c "${ARCHIVE}.sha256"
+
+                        unzip -q "$ARCHIVE"
+                        BIN=$(find . -type f -name 'BookMyDate' -perm -u+x | head -n 1)
+                        test -n "$BIN" || {
+                            echo "ERROR: packaged BookMyDate executable was not found."
+                            exit 1
+                        }
+                        QT_QPA_PLATFORM=offscreen "$BIN" --version | tee smoke-version.txt
+                        grep -F "Book My Date ${VERSION}" smoke-version.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Monitoring') {
+            when {
+                beforeAgent true
+                tag 'v*'
+            }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CREDENTIALS_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        VERSION=$(cat release/version.txt)
+                        ARCHIVE=$(find release -maxdepth 1 -name '*.zip' -print -quit)
+                        SIZE=$(wc -c < "$ARCHIVE")
+                        NAMESPACE="BookMyDate/Release"
+                        DIMENSIONS="Version=${VERSION},Environment=production"
+
+                        aws cloudwatch put-metric-data \
+                            --namespace "$NAMESPACE" \
+                            --metric-name SmokeTestSuccess \
+                            --value 1 \
+                            --unit Count \
+                            --dimensions "$DIMENSIONS"
+                        aws cloudwatch put-metric-data \
+                            --namespace "$NAMESPACE" \
+                            --metric-name ArtifactSizeBytes \
+                            --value "$SIZE" \
+                            --unit Bytes \
+                            --dimensions "$DIMENSIONS"
+
+                        ALARMS=$(aws cloudwatch describe-alarms \
+                            --alarm-name-prefix book-my-date \
+                            --state-value ALARM \
+                            --query 'MetricAlarms[].AlarmName' \
+                            --output text)
+                        if [ -n "$ALARMS" ]; then
+                            echo "CloudWatch alarms are active: $ALARMS"
+                            exit 1
+                        fi
+                        echo "CloudWatch health check passed for v${VERSION}"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            junit allowEmptyResults: true, keepLongStdio: true, testResults: 'junit/*.xml'
+            archiveArtifacts(
+                artifacts: 'release/**,artifacts/**,coverage/**,security/**,junit/**',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+            cleanWs()
+        }
+        success {
+            echo "Book My Date pipeline completed successfully."
+        }
+        failure {
+            echo "Book My Date pipeline failed. Inspect test, security, and Sonar reports."
+        }
+    }
+}

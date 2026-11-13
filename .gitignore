@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.venv-ci/
+venv/
+ENV/
+env/
+.python-version
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage/
+coverage.xml
+junit/
+security/
+artifacts/
+smoke/
+
+# Packaging
+packaging/build/
+packaging/dist/
+release/
+*.spec.bak
+
+# Local application data
+*.db
+*.db-wal
+*.db-shm
+*.log
+book_my_date.log
+install.json
+backups/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.lnk

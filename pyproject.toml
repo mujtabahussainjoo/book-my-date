@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "book-my-date"
+version = "1.0.0"
+description = "A private, local-first calendar and event booker with reminders"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Book My Date" }]
+keywords = ["calendar", "events", "reminders", "planner", "desktop"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Scheduling",
+]
+dependencies = ["PySide6-Essentials>=6.8.3,<7"]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.10,<7",
+    "pytest>=8.3,<10",
+    "pytest-cov>=6,<8",
+    "pip-audit>=2.7,<3",
+    "ruff>=0.8,<1",
+]
+
+[project.scripts]
+book-my-date = "book_my_date.app:main"
+
+
+[tool.setuptools.packages.find]
+include = ["book_my_date*"]
+
+[tool.setuptools.package-data]
+book_my_date = ["assets/*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = [".venv", "build", "dist", "release"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "UP006", "UP007", "UP035"]
+
+[tool.ruff.format]
+quote-style = "double"
