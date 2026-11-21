@@ -31,8 +31,8 @@ resolve_host_path() {
 }
 
 HOST_WORKSPACE_DIR="${HOST_WORKSPACE_DIR:-$(resolve_host_path "$WORKSPACE_DIR")}"
-if [ ! -d "$HOST_WORKSPACE_DIR" ]; then
-    echo "ERROR: Docker host workspace directory not found: $HOST_WORKSPACE_DIR" >&2
+if [ ! -d "$WORKSPACE_DIR" ]; then
+    echo "ERROR: Jenkins workspace directory not found: $WORKSPACE_DIR" >&2
     exit 1
 fi
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
