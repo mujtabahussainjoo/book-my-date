@@ -16,16 +16,22 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.calendar_utils import MONTH_NAMES, weekday_name
-from ..core.models import Event
+from ..core.models import Event, TaskTopic
 from . import icons
+from .task_widgets import TaskTopicCard
 from .theme import FAINT, INK, MUTED, accent_for
 from .widgets import EmptyState, EventCard, SectionLabel, make_divider
 
 
 class DayPanel(QFrame):
     addRequested = Signal(object)
+    taskRequested = Signal(object)
     editRequested = Signal(object)
+    taskEditRequested = Signal(object)
     deleteRequested = Signal(object)
+    progressChanged = Signal(int, int, int)
+    percentChanged = Signal(int, int)
+    percentReset = Signal(int)
 
     def __init__(
         self,
@@ -70,6 +76,16 @@ class DayPanel(QFrame):
         self.add_button.setStyleSheet("padding: 6px 12px; font-size: 11px;")
         self.add_button.clicked.connect(lambda: self.addRequested.emit(self._day))
         header.addWidget(self.add_button, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.task_button = QPushButton("Task")
+        self.task_button.setProperty("variant", "secondary")
+        self.task_button.setIcon(icons.icon("check-circle", accent_for(accent).color, 15))
+        self.task_button.setIconSize(QSize(14, 14))
+        self.task_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.task_button.setFixedHeight(34)
+        self.task_button.setStyleSheet("padding: 6px 10px; font-size: 11px;")
+        self.task_button.clicked.connect(lambda: self.taskRequested.emit(self._day))
+        header.addWidget(self.task_button, 0, Qt.AlignmentFlag.AlignTop)
         outer.addLayout(header)
         outer.addWidget(make_divider())
 
@@ -95,12 +111,20 @@ class DayPanel(QFrame):
 
     def set_accent(self, accent: str) -> None:
         self._accent = accent
+        color = accent_for(accent).color
         self.kicker.setStyleSheet(
-            f"color: {accent_for(accent).color}; font-size: 9px; font-weight: 800;"
+            f"color: {color}; font-size: 9px; font-weight: 800;"
         )
+        self.task_button.setIcon(icons.icon("check-circle", color, 15))
 
-    def set_day(self, day: date, events: list[Event]) -> None:
+    def set_day(
+        self,
+        day: date,
+        events: list[Event],
+        topics: list[TaskTopic] | None = None,
+    ) -> None:
         self._day = day
+        topics = topics or []
         today = date.today()
         difference = (day - today).days
         if difference == 0:
@@ -114,30 +138,44 @@ class DayPanel(QFrame):
         count = len(events)
         self.subtitle.setText(
             f"{weekday_name(day)}, {day.year} · "
-            f"{count} event{'s' if count != 1 else ''}"
+            f"{count} event{'s' if count != 1 else ''} · "
+            f"{len(topics)} task{'s' if len(topics) != 1 else ''}"
         )
         self._clear()
 
-        if not events:
+        if topics:
+            label = SectionLabel(
+                f"{len(topics)} repeating task{'s' if len(topics) != 1 else ''}"
+            )
+            label.setContentsMargins(2, 2, 2, 2)
+            self.list_layout.addWidget(label)
+            for topic in topics:
+                card = TaskTopicCard(topic, day)
+                card.editRequested.connect(self.taskEditRequested)
+                card.statusChanged.connect(self.progressChanged)
+                card.percentChanged.connect(self.percentChanged)
+                card.percentReset.connect(self.percentReset)
+                self.list_layout.addWidget(card)
+
+        if events:
+            label = SectionLabel(
+                f"{count} scheduled event{'s' if count != 1 else ''}"
+            )
+            label.setContentsMargins(2, 2, 2, 2)
+            self.list_layout.addWidget(label)
+            for event in events:
+                card = EventCard(event)
+                card.editRequested.connect(self.editRequested)
+                card.deleteRequested.connect(self.deleteRequested)
+                self.list_layout.addWidget(card)
+        elif not topics:
             empty = EmptyState(
                 "calendar",
                 "Nothing booked",
                 "This day is wide open. Add your first event to make it count.",
             )
             self.list_layout.addWidget(empty)
-            self.list_layout.addStretch(1)
-            return
 
-        day_label = SectionLabel(
-            f"{count} scheduled event{'s' if count != 1 else ''}"
-        )
-        day_label.setContentsMargins(2, 2, 2, 2)
-        self.list_layout.addWidget(day_label)
-        for event in events:
-            card = EventCard(event)
-            card.editRequested.connect(self.editRequested)
-            card.deleteRequested.connect(self.deleteRequested)
-            self.list_layout.addWidget(card)
         self.list_layout.addStretch(1)
 
     def _clear(self) -> None:

@@ -54,6 +54,16 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(launcher._install_record(Path(temp)), {})
 
+    def test_uninstall_flag_delegates_with_total_flags(self) -> None:
+        with mock.patch.object(launcher.subprocess, "call", return_value=0) as call:
+            code = launcher.main(["--uninstall"])
+        command = call.call_args.args[0]
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(command[1]), launcher.UNINSTALLER)
+        self.assertTrue(
+            {"--all", "--purge", "--yes", "--force"}.issubset(set(command))
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

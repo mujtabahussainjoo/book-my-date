@@ -13,13 +13,18 @@ from typing import Any, Iterable
 from .models import (
     DEFAULT_CATEGORY,
     DEFAULT_REMINDER_MINUTES,
+    DEFAULT_WEEKDAYS,
     Event,
+    Subtask,
+    TaskTopic,
     as_local,
     local_now,
+    validate_percent,
+    validate_status,
 )
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "week_start": "0",
@@ -117,6 +122,63 @@ class Database:
                     "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                     (key, value),
                 )
+            self._conn.commit()
+        if version < 2:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS task_topics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    apply_all INTEGER NOT NULL DEFAULT 1,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT,
+                    weekdays TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS task_subtasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    color TEXT NOT NULL DEFAULT 'indigo',
+                    position INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS task_progress (
+                    topic_id INTEGER NOT NULL,
+                    subtask_id INTEGER NOT NULL,
+                    day TEXT NOT NULL,
+                    status INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (subtask_id, day)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_task_subtasks_topic
+                    ON task_subtasks(topic_id, position);
+                CREATE INDEX IF NOT EXISTS idx_task_progress_day
+                    ON task_progress(day);
+                CREATE INDEX IF NOT EXISTS idx_task_progress_topic
+                    ON task_progress(topic_id);
+
+                PRAGMA user_version = 2;
+                """
+            )
+        if version < 3:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS task_topic_progress (
+                    topic_id INTEGER NOT NULL,
+                    day TEXT NOT NULL,
+                    percent INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (topic_id, day)
+                );
+                CREATE INDEX IF NOT EXISTS idx_topic_progress_day
+                    ON task_topic_progress(day);
+                PRAGMA user_version = 3;
+                """
+            )
             self._conn.commit()
 
     # ------------------------------------------------------------------ events
@@ -260,6 +322,285 @@ class Database:
                 (pattern, pattern, pattern, moment, moment, limit),
             ).fetchall()
         return [self._row_to_event(row) for row in rows]
+
+    # ------------------------------------------------------------ task topics
+    def add_topic(self, topic: TaskTopic) -> TaskTopic:
+        now = local_now()
+        record = topic.copy(id=None, created_at=now, updated_at=now, progress={})
+        values = self._topic_values(record)
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO task_topics(
+                    title, apply_all, start_date, end_date, weekdays,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            topic_id = int(cursor.lastrowid)
+            for position, subtask in enumerate(record.subtasks):
+                child = self._conn.execute(
+                    """
+                    INSERT INTO task_subtasks(topic_id, title, color, position)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (topic_id, subtask.title, subtask.color, position),
+                )
+                subtask.id = int(child.lastrowid)
+            self._conn.commit()
+        return record.copy(id=topic_id)
+
+    def update_topic(self, topic: TaskTopic) -> TaskTopic:
+        if topic.id is None:
+            raise DatabaseError("Cannot update a task topic without an id.")
+        existing = self.get_topic(topic.id)
+        if existing is None:
+            raise DatabaseError("That task topic no longer exists.")
+        now = local_now()
+        record = topic.copy(
+            created_at=existing.created_at,
+            updated_at=now,
+            progress={},
+        )
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE task_topics SET
+                    title = ?, apply_all = ?, start_date = ?, end_date = ?,
+                    weekdays = ?, created_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                self._topic_values(record) + (record.id,),
+            )
+            known_ids = {
+                subtask.id for subtask in existing.subtasks if subtask.id is not None
+            }
+            kept_ids = [
+                subtask.id
+                for subtask in record.subtasks
+                if subtask.id is not None and subtask.id in known_ids
+            ]
+            if kept_ids:
+                placeholders = ",".join("?" for _ in kept_ids)
+                self._conn.execute(
+                    f"""
+                    DELETE FROM task_progress
+                    WHERE subtask_id IN (
+                        SELECT id FROM task_subtasks
+                        WHERE topic_id = ? AND id NOT IN ({placeholders})
+                    )
+                    """,
+                    (record.id, *kept_ids),
+                )
+                self._conn.execute(
+                    f"""
+                    DELETE FROM task_subtasks
+                    WHERE topic_id = ? AND id NOT IN ({placeholders})
+                    """,
+                    (record.id, *kept_ids),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM task_progress WHERE topic_id = ?", (record.id,)
+                )
+                self._conn.execute(
+                    "DELETE FROM task_subtasks WHERE topic_id = ?", (record.id,)
+                )
+
+            for position, subtask in enumerate(record.subtasks):
+                if subtask.id is not None and subtask.id in known_ids:
+                    self._conn.execute(
+                        """
+                        UPDATE task_subtasks
+                        SET title = ?, color = ?, position = ?
+                        WHERE id = ? AND topic_id = ?
+                        """,
+                        (subtask.title, subtask.color, position, subtask.id, record.id),
+                    )
+                else:
+                    child = self._conn.execute(
+                        """
+                        INSERT INTO task_subtasks(topic_id, title, color, position)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (record.id, subtask.title, subtask.color, position),
+                    )
+                    subtask.id = int(child.lastrowid)
+            self._conn.commit()
+        return record.copy()
+
+    def delete_topic(self, topic_id: int) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM task_topics WHERE id = ?", (topic_id,)
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._conn.execute(
+                """
+                DELETE FROM task_progress
+                WHERE topic_id = ? OR subtask_id IN (
+                    SELECT id FROM task_subtasks WHERE topic_id = ?
+                )
+                """,
+                (topic_id, topic_id),
+            )
+            self._conn.execute("DELETE FROM task_subtasks WHERE topic_id = ?", (topic_id,))
+            self._conn.execute(
+                "DELETE FROM task_topic_progress WHERE topic_id = ?", (topic_id,)
+            )
+            self._conn.commit()
+            return True
+
+    def get_topic(self, topic_id: int) -> TaskTopic | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM task_topics WHERE id = ?", (topic_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            children = self._conn.execute(
+                """
+                SELECT * FROM task_subtasks
+                WHERE topic_id = ? ORDER BY position ASC, id ASC
+                """,
+                (topic_id,),
+            ).fetchall()
+        return self._row_to_topic(row, children)
+
+    def list_topics(self) -> list[TaskTopic]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM task_topics ORDER BY id ASC"
+            ).fetchall()
+            children = self._conn.execute(
+                "SELECT * FROM task_subtasks ORDER BY topic_id, position, id"
+            ).fetchall()
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for child in children:
+            grouped.setdefault(int(child["topic_id"]), []).append(child)
+        return [
+            self._row_to_topic(row, grouped.get(int(row["id"]), [])) for row in rows
+        ]
+
+    def topics_for_day(self, day: date) -> list[TaskTopic]:
+        return self.topics_by_day(day, day).get(day, [])
+
+    def topics_by_day(self, start: date, end: date) -> dict[date, list[TaskTopic]]:
+        """Return topic definitions and their per-date progress for a date range."""
+
+        if end < start:
+            return {}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM task_topics ORDER BY id ASC"
+            ).fetchall()
+            if not rows:
+                return {}
+            children = self._conn.execute(
+                "SELECT * FROM task_subtasks ORDER BY topic_id, position, id"
+            ).fetchall()
+            progress = self._conn.execute(
+                """
+                SELECT * FROM task_progress
+                WHERE day >= ? AND day <= ?
+                """,
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+            manual_progress = self._conn.execute(
+                """
+                SELECT * FROM task_topic_progress
+                WHERE day >= ? AND day <= ?
+                """,
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for child in children:
+            grouped.setdefault(int(child["topic_id"]), []).append(child)
+        definitions = [
+            self._row_to_topic(row, grouped.get(int(row["id"]), [])) for row in rows
+        ]
+
+        result: dict[date, list[TaskTopic]] = {}
+        day = start
+        while day <= end:
+            for definition in definitions:
+                if definition.applies_on(day):
+                    result.setdefault(day, []).append(definition.copy(progress={}))
+            day += timedelta(days=1)
+
+        indexed = {
+            (topic.id, day): topic
+            for day, topics in result.items()
+            for topic in topics
+        }
+        for row in progress:
+            key = (int(row["topic_id"]), date.fromisoformat(str(row["day"])))
+            topic = indexed.get(key)
+            if topic is not None:
+                topic.progress[int(row["subtask_id"])] = int(row["status"])
+        for row in manual_progress:
+            key = (int(row["topic_id"]), date.fromisoformat(str(row["day"])))
+            topic = indexed.get(key)
+            if topic is not None:
+                topic.manual_progress[key[1]] = int(row["percent"])
+        return result
+
+    def set_topic_progress(self, topic_id: int, day: date, percent: int) -> None:
+        value = validate_percent(percent)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM task_topics WHERE id = ?", (topic_id,)
+            ).fetchone()
+            if row is None:
+                raise DatabaseError("That task topic no longer exists.")
+            self._conn.execute(
+                """
+                INSERT INTO task_topic_progress(topic_id, day, percent, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(topic_id, day) DO UPDATE SET
+                    percent = excluded.percent,
+                    updated_at = excluded.updated_at
+                """,
+                (topic_id, day.isoformat(), value, _to_utc_text(local_now())),
+            )
+            self._conn.commit()
+
+    def clear_topic_progress(self, topic_id: int, day: date) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM task_topic_progress WHERE topic_id = ? AND day = ?",
+                (topic_id, day.isoformat()),
+            )
+            self._conn.commit()
+
+    def set_subtask_progress(self, subtask_id: int, day: date, status: int) -> None:
+        value = validate_status(status)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT topic_id FROM task_subtasks WHERE id = ?", (subtask_id,)
+            ).fetchone()
+            if row is None:
+                raise DatabaseError("That subtask no longer exists.")
+            self._conn.execute(
+                """
+                INSERT INTO task_progress(topic_id, subtask_id, day, status, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(subtask_id, day) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(row["topic_id"]),
+                    subtask_id,
+                    day.isoformat(),
+                    value,
+                    _to_utc_text(local_now()),
+                ),
+            )
+            self._conn.commit()
 
     # --------------------------------------------------------------- reminders
     def due_reminders(self, now: datetime | None = None) -> list[Event]:
@@ -438,6 +779,63 @@ class Database:
         self.close()
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _weekdays_text(weekdays: Iterable[int]) -> str:
+        values = sorted(set(int(day) for day in weekdays))
+        if not values:
+            values = sorted(DEFAULT_WEEKDAYS)
+        return ",".join(str(day) for day in values)
+
+    @staticmethod
+    def _parse_weekdays(text: str | None) -> frozenset[int]:
+        try:
+            values = {int(part) for part in (text or "").split(",") if part.strip()}
+        except ValueError:
+            values = set()
+        if not values:
+            values = set(DEFAULT_WEEKDAYS)
+        return frozenset(day for day in values if 0 <= day <= 6)
+
+    @classmethod
+    def _topic_values(cls, topic: TaskTopic) -> tuple[Any, ...]:
+        now = local_now()
+        return (
+            topic.title,
+            int(topic.apply_to_all_dates),
+            topic.start_date.isoformat(),
+            topic.end_date.isoformat() if topic.end_date is not None else None,
+            cls._weekdays_text(topic.weekdays),
+            _to_utc_text(topic.created_at or now),
+            _to_utc_text(topic.updated_at or now),
+        )
+
+    @staticmethod
+    def _row_to_topic(
+        row: sqlite3.Row, children: Iterable[sqlite3.Row]
+    ) -> TaskTopic:
+        subtasks = [
+            Subtask(
+                id=int(child["id"]),
+                title=str(child["title"]),
+                color=str(child["color"]),
+                position=int(child["position"]),
+            )
+            for child in children
+        ]
+        return TaskTopic(
+            id=int(row["id"]),
+            title=str(row["title"]),
+            subtasks=subtasks,
+            apply_to_all_dates=bool(row["apply_all"]),
+            start_date=date.fromisoformat(str(row["start_date"])),
+            end_date=(
+                date.fromisoformat(str(row["end_date"])) if row["end_date"] else None
+            ),
+            weekdays=Database._parse_weekdays(row["weekdays"]),
+            created_at=_from_text(str(row["created_at"])),
+            updated_at=_from_text(str(row["updated_at"])),
+        )
+
     @staticmethod
     def _event_values(event: Event) -> tuple[Any, ...]:
         reminder_at = event.reminder_at

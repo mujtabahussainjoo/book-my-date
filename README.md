@@ -8,6 +8,8 @@ database.
 
 - Month calendar with distinct weekend colours and multiple events per day
 - Agenda panel with create, edit, delete and all-day events
+- Repeating task topics with clearly labelled one-click subtask status buttons, a per-date
+  overall percentage, weekday filters and live colours
 - Search across titles, descriptions and locations
 - Reminder scheduling with 20-second polling, snooze and native notifications
 - Optional system tray integration and close-to-tray behaviour
@@ -73,6 +75,44 @@ You can also run setup from any platform with:
 python3 launcher.py --setup
 ```
 
+## Uninstall
+
+Setup creates a one-click **Uninstall Book My Date** icon on each platform:
+
+| Platform | Icon |
+| --- | --- |
+| Linux | desktop file named **Uninstall Book My Date.desktop** |
+| Windows | desktop shortcut **Uninstall Book My Date.lnk** |
+| macOS | **Uninstall Book My Date.app** in Applications and on the Desktop |
+
+Clicking it closes a running app, checks every standard install location and
+removes the app, its virtual environment, every shortcut, the database, backups,
+logs and saved preferences without asking questions. To keep calendar data, run
+the project's launcher with `--keep-data`:
+
+| Platform | Manual launcher |
+| --- | --- |
+| Linux | `./"Uninstall Book My Date.sh"` |
+| Windows | double-click **Uninstall Book My Date.bat** |
+| macOS | double-click **Uninstall Book My Date.command** |
+
+From the project folder, the simplest equivalent is:
+
+```bash
+python3 launcher.py --uninstall
+```
+
+Other options: `--dry-run` previews, `--all` scans every standard location,
+`--yes` confirms non-interactively, `--force` closes the app automatically, and
+`--data-dir` targets a non-default installation:
+
+```bash
+python3 uninstaller/uninstall.py --all --purge --yes --force
+```
+
+On Windows, **Create Windows Shortcuts.bat** regenerates the one-click Uninstall
+shortcut along with Start and Setup.
+
 ## What setup does
 
 The wizard:
@@ -81,11 +121,13 @@ The wizard:
 2. Backs up any existing database.
 3. Copies the application into its private data folder.
 4. Creates a virtual environment and installs PySide6.
-5. Adds a desktop shortcut, Start menu entry or macOS app bundle.
+5. Adds a desktop shortcut, Start menu entry or macOS app bundle, plus a
+   one-click Uninstall icon.
 6. Verifies the toolkit and optionally opens the calendar.
 
-Nothing is installed system-wide. Removing the application data folder removes
-the app and your events, so keep a backup first.
+Nothing is installed system-wide. The uninstaller removes the app without
+touching your events by default; use `--purge` only when you also want to delete
+the database and backups.
 
 ## Data locations
 
@@ -110,6 +152,7 @@ Useful files inside the data folder:
 - `book_my_date.db` — events and settings
 - `book_my_date.log` — application log
 - `install.json` — installed version and environment metadata
+- `uninstall.py` — copy of the uninstaller, so the project folder is not needed
 - `backups/` — database snapshots created before updates
 - `app/` — installed application copy
 - `venv/` — private Python environment
@@ -152,7 +195,7 @@ Run lint and compilation checks:
 
 ```bash
 ruff check .
-python -m compileall -q book_my_date installer launcher.py
+python -m compileall -q book_my_date installer uninstaller launcher.py
 ```
 
 A headless smoke test can start the UI without a display server:
@@ -175,6 +218,7 @@ are expected in headless environments.
 | `Ctrl+,` | Settings |
 | `Ctrl+Left` / `Ctrl+Right` | Previous / next month |
 | `Ctrl+T` | Jump to today |
+| `Ctrl+Shift+T` | New task topic |
 | `Escape` | Close search or clear the query |
 
 ## Packaging
@@ -223,7 +267,10 @@ book_my_date/
 installer/
   wizard.py              standard-library local setup server
   wizard.html            branded browser setup interface
+uninstaller/
+  uninstall.py           standard-library cross-platform uninstaller
 launcher.py              click launcher and installed-app starter
+Setup/Start/Uninstall Book My Date.*  one-click launchers for each OS
 tools/generate_assets.py brand asset generator
 tools/windows/           Windows shortcut-with-icon helper
 jenkins-pipeline/        Declarative and Scripted production pipelines

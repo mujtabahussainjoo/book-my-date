@@ -356,6 +356,9 @@ class Controller:
                 shutil.copy2(origin, self.app_dir / name)
         requirements = self.app_dir / "requirements.txt"
         requirements.write_text(REQUIREMENTS + "\n", encoding="utf-8")
+        uninstaller = self.root / "uninstaller" / "uninstall.py"
+        if uninstaller.exists():
+            shutil.copy2(uninstaller, self.data_dir / "uninstall.py")
         (self.app_dir / "run.py").write_text(
             "import os\n"
             "from pathlib import Path\n\n"
@@ -515,12 +518,37 @@ class Controller:
         menu_file.chmod(0o755)
         created = [str(menu_file)]
 
+        setup_python = Path(sys.executable)
+        uninstall_entry = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Type=Application\n"
+            "Name=Uninstall Book My Date\n"
+            "GenericName=Uninstaller\n"
+            "Comment=Remove Book My Date from this computer\n"
+            f"Exec={_desktop_quote(str(setup_python))} "
+            f"{_desktop_quote(str(self.data_dir / 'uninstall.py'))} "
+            "--all --purge --yes --force\n"
+            f"Path={self.data_dir}\n"
+            f"Icon={icon}\n"
+            "Terminal=false\n"
+            "Categories=Office;System;\n"
+        )
+        uninstall_menu = apps_dir / "book-my-date-uninstall.desktop"
+        uninstall_menu.write_text(uninstall_entry, encoding="utf-8")
+        uninstall_menu.chmod(0o755)
+        created.append(str(uninstall_menu))
+
         desktop = self._linux_desktop_dir()
         if desktop is not None:
             desktop_file = desktop / "Book My Date.desktop"
             desktop_file.write_text(entry, encoding="utf-8")
             desktop_file.chmod(0o755)
             created.append(str(desktop_file))
+            uninstall_desktop = desktop / "Uninstall Book My Date.desktop"
+            uninstall_desktop.write_text(uninstall_entry, encoding="utf-8")
+            uninstall_desktop.chmod(0o755)
+            created.append(str(uninstall_desktop))
 
         bin_dir = Path.home() / ".local" / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
@@ -544,25 +572,34 @@ class Controller:
     def _create_macos_app(self, python: Path) -> list[str]:
         applications = Path.home() / "Applications"
         applications.mkdir(parents=True, exist_ok=True)
-        bundle = applications / "Book My Date.app"
-        if bundle.exists():
-            shutil.rmtree(bundle)
-        contents = bundle / "Contents"
-        macos = contents / "MacOS"
-        resources = contents / "Resources"
-        macos.mkdir(parents=True)
-        resources.mkdir(parents=True)
-        (contents / "Info.plist").write_text(
-            """<?xml version="1.0" encoding="UTF-8"?>
+        icon = self.root / "book_my_date" / "assets" / "app.icns"
+
+        def write_bundle(
+            bundle: Path,
+            display_name: str,
+            identifier: str,
+            executable: str,
+            command: str,
+            working_dir: Path,
+        ) -> None:
+            if bundle.exists():
+                shutil.rmtree(bundle)
+            contents = bundle / "Contents"
+            macos = contents / "MacOS"
+            resources = contents / "Resources"
+            macos.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            (contents / "Info.plist").write_text(
+                f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Book My Date</string>
-  <key>CFBundleDisplayName</key><string>Book My Date</string>
-  <key>CFBundleIdentifier</key><string>io.bookmydate.app</string>
-  <key>CFBundleVersion</key><string>__VERSION__</string>
-  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
-  <key>CFBundleExecutable</key><string>BookMyDate</string>
+  <key>CFBundleName</key><string>{display_name}</string>
+  <key>CFBundleDisplayName</key><string>{display_name}</string>
+  <key>CFBundleIdentifier</key><string>{identifier}</string>
+  <key>CFBundleVersion</key><string>{APP_VERSION}</string>
+  <key>CFBundleShortVersionString</key><string>{APP_VERSION}</string>
+  <key>CFBundleExecutable</key><string>{executable}</string>
   <key>CFBundleIconFile</key><string>app.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>10.15</string>
@@ -570,30 +607,66 @@ class Controller:
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
 </dict>
 </plist>
-""".replace("__VERSION__", APP_VERSION),
-            encoding="utf-8",
+""",
+                encoding="utf-8",
+            )
+            shutil.copy2(icon, resources / "app.icns")
+            launcher = macos / executable
+            launcher.write_text(
+                "#!/bin/bash\n"
+                f"cd {shlex.quote(str(working_dir))} || exit 1\n"
+                f"exec {command} \"$@\"\n",
+                encoding="utf-8",
+            )
+            launcher.chmod(0o755)
+
+        bundle = applications / "Book My Date.app"
+        write_bundle(
+            bundle,
+            "Book My Date",
+            "io.bookmydate.app",
+            "BookMyDate",
+            f"{shlex.quote(str(python))} {shlex.quote(str(self.app_dir / 'run.py'))}",
+            self.app_dir,
         )
-        shutil.copy2(
-            self.root / "book_my_date" / "assets" / "app.icns",
-            resources / "app.icns",
-        )
-        launcher = macos / "BookMyDate"
-        launcher.write_text(
-            "#!/bin/bash\n"
-            f"cd {shlex.quote(str(self.app_dir))} || exit 1\n"
-            f"exec {shlex.quote(str(python))} "
-            f"{shlex.quote(str(self.app_dir / 'run.py'))} \"$@\"\n",
-            encoding="utf-8",
-        )
-        launcher.chmod(0o755)
         self._log(f"Created macOS app bundle at {bundle}")
-        return [str(bundle)]
+        created = [str(bundle)]
+
+        uninstall_bundle = applications / "Uninstall Book My Date.app"
+        setup_python = Path(sys.executable)
+        write_bundle(
+            uninstall_bundle,
+            "Uninstall Book My Date",
+            "io.bookmydate.uninstall",
+            "UninstallBookMyDate",
+            f"{shlex.quote(str(setup_python))} "
+            f"{shlex.quote(str(self.data_dir / 'uninstall.py'))} "
+            "--all --purge --yes --force",
+            self.data_dir,
+        )
+        created.append(str(uninstall_bundle))
+
+        desktop = Path.home() / "Desktop"
+        if desktop.exists():
+            desktop_bundle = desktop / "Uninstall Book My Date.app"
+            if desktop_bundle.exists():
+                shutil.rmtree(desktop_bundle)
+            shutil.copytree(uninstall_bundle, desktop_bundle)
+            created.append(str(desktop_bundle))
+        return created
 
     def _create_windows_shortcuts(self, python: Path) -> list[str]:
         pythonw = _venv_pythonw(self.venv_dir)
+        setup_executable = Path(sys.executable)
+        uninstall_python = setup_executable.with_name("pythonw.exe")
+        if not uninstall_python.exists():
+            uninstall_python = setup_executable
         icon = self.app_dir / "book_my_date" / "assets" / "app.ico"
         target = str(pythonw)
         arguments = f'"{self.app_dir / "run.py"}"'
+        uninstall_arguments = (
+            f'"{self.data_dir / "uninstall.py"}" --all --purge --yes --force'
+        )
         working = str(self.app_dir)
 
         def quote(value: str) -> str:
@@ -613,6 +686,18 @@ class Controller:
             f"  $s.WorkingDirectory = '{quote(working)}'\n"
             f"  $s.IconLocation = '{quote(str(icon))},0'\n"
             "  $s.Description = 'Book My Date'\n"
+            "  $s.Save()\n"
+            "  Write-Output $path\n"
+            "}\n"
+            "foreach ($dir in $targets) {\n"
+            "  if (-not $dir) { continue }\n"
+            "  $path = Join-Path $dir 'Uninstall Book My Date.lnk'\n"
+            "  $s = $ws.CreateShortcut($path)\n"
+            f"  $s.TargetPath = '{quote(str(uninstall_python))}'\n"
+            f"  $s.Arguments = '{quote(uninstall_arguments)}'\n"
+            f"  $s.WorkingDirectory = '{quote(str(self.data_dir))}'\n"
+            f"  $s.IconLocation = '{quote(str(icon))},0'\n"
+            "  $s.Description = 'Uninstall Book My Date'\n"
             "  $s.Save()\n"
             "  Write-Output $path\n"
             "}\n"

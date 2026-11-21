@@ -29,7 +29,7 @@ from ..core.calendar_utils import (
     relative_day_label,
 )
 from ..core.database import Database, DatabaseError
-from ..core.models import Event
+from ..core.models import Event, TaskTopic
 from ..core.notifications import notify as native_notify
 from ..core.reminders import ReminderEngine
 from . import icons
@@ -37,6 +37,7 @@ from .calendar_widget import CalendarWidget
 from .day_panel import DayPanel
 from .event_dialog import EventDialog
 from .settings_dialog import SettingsDialog
+from .task_dialog import TaskDialog
 from .theme import MUTED, SIDEBAR_MUTED, accent_for, apply_theme
 from .widgets import (
     ElidedLabel,
@@ -124,12 +125,18 @@ class MainWindow(QMainWindow):
 
         self.calendar.dateSelected.connect(self._on_date_selected)
         self.calendar.eventActivated.connect(self._edit_event)
+        self.calendar.topicActivated.connect(self._edit_topic)
         self.calendar.addRequested.connect(self._new_event)
         self.calendar.monthChanged.connect(self._on_month_changed)
 
         self.day_panel.addRequested.connect(self._new_event)
+        self.day_panel.taskRequested.connect(self._new_topic)
         self.day_panel.editRequested.connect(self._edit_event)
+        self.day_panel.taskEditRequested.connect(self._edit_topic)
         self.day_panel.deleteRequested.connect(self._delete_event)
+        self.day_panel.progressChanged.connect(self._set_progress)
+        self.day_panel.percentChanged.connect(self._set_topic_progress)
+        self.day_panel.percentReset.connect(self._reset_topic_progress)
         self.search.textChanged.connect(self._on_search)
         self.search.returnPressed.connect(self._open_first_result)
         self.search_popup.eventChosen.connect(self._on_search_choice)
@@ -218,6 +225,15 @@ class MainWindow(QMainWindow):
         self.new_button.setFixedHeight(40)
         self.new_button.clicked.connect(lambda: self._new_event(self.calendar.selected_date))
         bar.addWidget(self.new_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.new_task_button = QPushButton("New task")
+        self.new_task_button.setProperty("variant", "secondary")
+        self.new_task_button.setIcon(icons.icon("check-circle", accent_for(self.accent_key).color, 16))
+        self.new_task_button.setIconSize(QSize(15, 15))
+        self.new_task_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.new_task_button.setFixedHeight(40)
+        self.new_task_button.clicked.connect(lambda: self._new_topic(self.calendar.selected_date))
+        bar.addWidget(self.new_task_button, 0, Qt.AlignmentFlag.AlignVCenter)
         return bar
 
     def _build_sidebar(self) -> QFrame:
@@ -258,6 +274,15 @@ class MainWindow(QMainWindow):
         self.sidebar_new.setFixedHeight(42)
         self.sidebar_new.clicked.connect(lambda: self._new_event(self.calendar.selected_date))
         layout.addWidget(self.sidebar_new)
+
+        self.sidebar_task = QPushButton("  New task topic")
+        self.sidebar_task.setProperty("variant", "sidebar")
+        self.sidebar_task.setIcon(icons.icon("check-circle", SIDEBAR_MUTED, 16))
+        self.sidebar_task.setIconSize(QSize(15, 15))
+        self.sidebar_task.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sidebar_task.setFixedHeight(38)
+        self.sidebar_task.clicked.connect(lambda: self._new_topic(self.calendar.selected_date))
+        layout.addWidget(self.sidebar_task)
 
         divider = QFrame()
         divider.setObjectName("SidebarDivider")
@@ -338,6 +363,7 @@ class MainWindow(QMainWindow):
         self._shortcuts: list[QShortcut] = []
         for sequence, callback in (
             ("Ctrl+N", lambda: self._new_event(self.calendar.selected_date)),
+            ("Ctrl+Shift+T", lambda: self._new_topic(self.calendar.selected_date)),
             ("Ctrl+F", self._focus_search),
             ("Ctrl+,", self._open_settings),
             ("Ctrl+Left", lambda: self.calendar.prev_button.click()),
@@ -370,6 +396,8 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._show_window)
         new_action = menu.addAction("New event")
         new_action.triggered.connect(self._tray_new_event)
+        new_task_action = menu.addAction("New task topic")
+        new_task_action.triggered.connect(self._tray_new_topic)
         menu.addSeparator()
         quit_action = menu.addAction("Quit")
         quit_action.triggered.connect(self.quit_app)
@@ -398,6 +426,10 @@ class MainWindow(QMainWindow):
         self._show_window()
         self._new_event(self.calendar.selected_date)
 
+    def _tray_new_topic(self) -> None:
+        self._show_window()
+        self._new_topic(self.calendar.selected_date)
+
     def _update_tray_tooltip(self) -> None:
         if self.tray is None:
             return
@@ -425,6 +457,7 @@ class MainWindow(QMainWindow):
         start, end = grid[0][0], grid[-1][-1]
         events = self.database.list_events(start, end)
         self.calendar.set_events(group_events_by_day(events))
+        self.calendar.set_topics(self.database.topics_by_day(start, end))
 
     def _refresh_sidebar(self) -> None:
         while self.upcoming_layout.count():
@@ -464,7 +497,8 @@ class MainWindow(QMainWindow):
         self.search_popup.hide()
         self._refresh_header(day)
         events = self.database.events_for_day(day)
-        self.day_panel.set_day(day, events)
+        topics = self.database.topics_for_day(day)
+        self.day_panel.set_day(day, events, topics)
 
     def _on_month_changed(self, _year: int, _month: int) -> None:
         self._refresh_calendar_data()
@@ -550,6 +584,93 @@ class MainWindow(QMainWindow):
         self.calendar.set_selected(target, emit=False)
         self._refresh_all()
         QTimer.singleShot(600, self._check_reminders)
+
+    # ------------------------------------------------------------ task topics
+    def _new_topic(self, selected_date: date) -> None:
+        dialog = TaskDialog(
+            selected_date=selected_date,
+            accent=self.accent_key,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        topic = dialog.created_topic()
+        if topic is None:
+            return
+        try:
+            self.database.add_topic(topic)
+        except (DatabaseError, ValueError) as exc:
+            QMessageBox.critical(self, "Could not save task topic", str(exc))
+            return
+        self._refresh_all()
+        self._show_notice("Task topic created. It appears on your calendar dates.")
+
+    def _edit_topic(self, topic: TaskTopic) -> None:
+        fresh = self.database.get_topic(topic.id) if topic.id is not None else topic
+        if fresh is None:
+            self._show_notice("That task topic no longer exists.", kind="error")
+            self._refresh_all()
+            return
+        dialog = TaskDialog(
+            selected_date=self.calendar.selected_date,
+            accent=self.accent_key,
+            topic=fresh,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.deleted:
+            if topic.id is None or not self.database.delete_topic(topic.id):
+                self._show_notice("That task topic no longer exists.", kind="error")
+            else:
+                self._show_notice("Task topic deleted.")
+            self._refresh_all()
+            return
+        updated = dialog.created_topic()
+        if updated is None:
+            return
+        try:
+            self.database.update_topic(updated)
+        except (DatabaseError, ValueError) as exc:
+            QMessageBox.critical(self, "Could not update task topic", str(exc))
+            return
+        self._refresh_all()
+        self._show_notice("Task topic updated.")
+
+    def _set_progress(self, topic_id: int, subtask_id: int, status: int) -> None:
+        try:
+            self.database.set_subtask_progress(
+                subtask_id, self.calendar.selected_date, status
+            )
+        except (DatabaseError, ValueError) as exc:
+            self._show_notice(f"Could not save progress: {exc}", kind="error")
+            return
+        self._defer_progress_refresh()
+
+    def _set_topic_progress(self, topic_id: int, percent: int) -> None:
+        try:
+            self.database.set_topic_progress(
+                topic_id, self.calendar.selected_date, percent
+            )
+        except (DatabaseError, ValueError) as exc:
+            self._show_notice(f"Could not save completion: {exc}", kind="error")
+            return
+        self._defer_progress_refresh()
+
+    def _reset_topic_progress(self, topic_id: int) -> None:
+        try:
+            self.database.clear_topic_progress(topic_id, self.calendar.selected_date)
+        except DatabaseError as exc:
+            self._show_notice(f"Could not reset completion: {exc}", kind="error")
+            return
+        self._defer_progress_refresh()
+
+    def _defer_progress_refresh(self) -> None:
+        QTimer.singleShot(0, self._apply_progress_refresh)
+
+    def _apply_progress_refresh(self) -> None:
+        self._refresh_calendar_data()
+        self._on_date_selected(self.calendar.selected_date)
 
     # ------------------------------------------------------------------ search
     def _on_search(self, text: str) -> None:
@@ -683,6 +804,9 @@ class MainWindow(QMainWindow):
         self.calendar.set_accent(self.accent_key)
         self.calendar.set_week_start(self.week_start)
         self.day_panel.set_accent(self.accent_key)
+        self.new_task_button.setIcon(
+            icons.icon("check-circle", accent_for(self.accent_key).color, 16)
+        )
         self._refresh_all()
         self._show_notice("Settings saved.")
 

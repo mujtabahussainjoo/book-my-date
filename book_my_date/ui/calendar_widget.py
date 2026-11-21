@@ -26,8 +26,9 @@ from ..core.calendar_utils import (
     weekday_headers,
     weekend_kind,
 )
-from ..core.models import CATEGORIES, Event
+from ..core.models import CATEGORIES, Event, TaskTopic
 from . import icons
+from .task_widgets import TopicChip
 from .theme import (
     FAINT,
     MUTED,
@@ -36,11 +37,13 @@ from .theme import (
 from .widgets import EventChip, IconButton
 
 MAX_VISIBLE_EVENTS = 3
+MAX_VISIBLE_TOPICS = 2
 
 
 class DayCell(QWidget):
     selected = Signal(object)
     eventActivated = Signal(object)
+    topicActivated = Signal(object)
     addRequested = Signal(object)
 
     def __init__(
@@ -87,6 +90,7 @@ class DayCell(QWidget):
         selected: bool,
         today: date,
         current_month: int,
+        topics: list[TaskTopic] | None = None,
     ) -> None:
         weekend = weekend_kind(self.day)
         outside = self.day.month != current_month
@@ -103,9 +107,11 @@ class DayCell(QWidget):
         self.number.setAlignment(Qt.AlignmentFlag.AlignCenter)
         repolish(self.number)
 
+        topics = topics or []
+        event_text = f"{len(events)} event{'s' if len(events) != 1 else ''}"
+        topic_text = f"{len(topics)} task{'s' if len(topics) != 1 else ''}"
         self.setToolTip(
-            f"{self.day.strftime('%A, %d %B %Y')} · "
-            f"{len(events)} event{'s' if len(events) != 1 else ''}"
+            f"{self.day.strftime('%A, %d %B %Y')} · {event_text} · {topic_text}"
         )
 
         while self.chips.count():
@@ -114,7 +120,14 @@ class DayCell(QWidget):
             if widget is not None:
                 widget.deleteLater()
 
-        visible = events[:MAX_VISIBLE_EVENTS]
+        visible_topics = topics[:MAX_VISIBLE_TOPICS]
+        for topic in visible_topics:
+            chip = TopicChip(topic, self.day)
+            chip.clicked.connect(self.topicActivated)
+            self.chips.addWidget(chip)
+
+        event_limit = max(1, MAX_VISIBLE_EVENTS - len(visible_topics))
+        visible = events[:event_limit]
         for event in visible:
             chip = EventChip(
                 event,
@@ -124,7 +137,7 @@ class DayCell(QWidget):
             chip.clicked.connect(self.eventActivated)
             self.chips.addWidget(chip)
 
-        hidden = len(events) - len(visible)
+        hidden = len(topics) - len(visible_topics) + len(events) - len(visible)
         if hidden > 0:
             more = QLabel(f"+{hidden} more")
             more.setObjectName("MoreLabel")
@@ -146,6 +159,7 @@ class CalendarWidget(QWidget):
     monthChanged = Signal(int, int)
     dateSelected = Signal(object)
     eventActivated = Signal(object)
+    topicActivated = Signal(object)
     addRequested = Signal(object)
 
     def __init__(
@@ -160,6 +174,7 @@ class CalendarWidget(QWidget):
         self._week_start = normalize_week_start(week_start)
         self._accent = accent
         self._events_by_day: dict[date, list[Event]] = {}
+        self._topics_by_day: dict[date, list[TaskTopic]] = {}
         self._year = date.today().year
         self._month = date.today().month
         self._selected = date.today()
@@ -255,6 +270,11 @@ class CalendarWidget(QWidget):
 
     def set_events(self, events_by_day: dict[date, list[Event]]) -> None:
         self._events_by_day = events_by_day
+        self._refresh_cells()
+        self._update_summary()
+
+    def set_topics(self, topics_by_day: dict[date, list[TaskTopic]]) -> None:
+        self._topics_by_day = topics_by_day
         self._refresh_cells()
         self._update_summary()
 
@@ -356,6 +376,7 @@ class CalendarWidget(QWidget):
                 cell = DayCell(day, accent=self._accent)
                 cell.selected.connect(self._on_cell_selected)
                 cell.eventActivated.connect(self.eventActivated)
+                cell.topicActivated.connect(self.topicActivated)
                 cell.addRequested.connect(self.addRequested)
                 self._grid.addWidget(cell, row, column)
                 row_cells.append(cell)
@@ -376,6 +397,7 @@ class CalendarWidget(QWidget):
                     selected=cell.day == self._selected,
                     today=self._today,
                     current_month=self._month,
+                    topics=self._topics_by_day.get(cell.day, []),
                 )
 
     def _update_summary(self) -> None:
@@ -384,11 +406,24 @@ class CalendarWidget(QWidget):
             if day.year == self._year and day.month == self._month:
                 unique.update(event.id for event in events if event.id is not None)
         count = len(unique)
-        self.summary_label.setText(
-            "No events this month"
+        topic_ids = {
+            topic.id
+            for day, topics in self._topics_by_day.items()
+            if day.year == self._year and day.month == self._month
+            for topic in topics
+            if topic.id is not None
+        }
+        events_text = (
+            "No events"
             if count == 0
-            else f"{count} event{'s' if count != 1 else ''} this month"
+            else f"{count} event{'s' if count != 1 else ''}"
         )
+        topics_text = (
+            ""
+            if not topic_ids
+            else f" · {len(topic_ids)} task topic{'s' if len(topic_ids) != 1 else ''}"
+        )
+        self.summary_label.setText(f"{events_text}{topics_text} this month")
 
     def _on_cell_selected(self, day: date) -> None:
         self.set_selected(day)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -129,6 +131,81 @@ class WizardHelperTests(unittest.TestCase):
             runner = (root / "app" / "run.py").read_text(encoding="utf-8")
             self.assertIn("BOOK_MY_DATE_HOME", runner)
             self.assertIn("parent.parent", runner)
+            self.assertTrue((root / "uninstall.py").is_file())
+
+    def test_linux_shortcuts_include_one_click_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / "Desktop").mkdir()
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, {"BOOK_MY_DATE_HOME": str(home / "data")}),
+                mock.patch.object(wizard.sys, "platform", "linux"),
+            ):
+                controller = wizard.Controller()
+                controller.data_dir.mkdir(parents=True)
+                (controller.data_dir / "uninstall.py").write_text("", encoding="utf-8")
+                created = controller._create_linux_shortcuts(Path("/venv/bin/python"))
+
+            self.assertTrue(
+                any("book-my-date-uninstall.desktop" in item for item in created)
+            )
+            entry = (home / "Desktop" / "Uninstall Book My Date.desktop").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("--all --purge --yes --force", entry)
+
+    def test_macos_shortcuts_include_one_click_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / "Desktop").mkdir()
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, {"BOOK_MY_DATE_HOME": str(home / "data")}),
+                mock.patch.object(wizard.sys, "platform", "darwin"),
+            ):
+                controller = wizard.Controller()
+                controller.data_dir.mkdir(parents=True)
+                (controller.data_dir / "uninstall.py").write_text("", encoding="utf-8")
+                created = controller._create_macos_app(Path("/venv/bin/python"))
+
+            self.assertTrue(
+                any("Uninstall Book My Date.app" in item for item in created)
+            )
+            launcher = (
+                home
+                / "Applications"
+                / "Uninstall Book My Date.app"
+                / "Contents"
+                / "MacOS"
+                / "UninstallBookMyDate"
+            )
+            self.assertIn(
+                "--all --purge --yes --force", launcher.read_text(encoding="utf-8")
+            )
+
+    def test_windows_shortcuts_include_one_click_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, {"BOOK_MY_DATE_HOME": str(home / "data")}),
+                mock.patch.object(wizard.sys, "platform", "win32"),
+            ):
+                controller = wizard.Controller()
+                controller.data_dir.mkdir(parents=True)
+                captured: dict[str, str] = {}
+
+                def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+                    encoded = command[command.index("-EncodedCommand") + 1]
+                    captured["script"] = base64.b64decode(encoded).decode("utf-16-le")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with mock.patch.object(wizard.subprocess, "run", side_effect=fake_run):
+                    controller._create_windows_shortcuts(Path("/venv/pythonw.exe"))
+
+            self.assertIn("Uninstall Book My Date.lnk", captured["script"])
+            self.assertIn("--all --purge --yes --force", captured["script"])
 
     def test_install_options_defaults(self) -> None:
         options = wizard.InstallOptions()

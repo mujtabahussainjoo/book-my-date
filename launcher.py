@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIZARD = ROOT / "installer" / "wizard.py"
+UNINSTALLER = ROOT / "uninstaller" / "uninstall.py"
 
 
 def install_root() -> Path:
@@ -152,6 +153,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="always open the setup/repair wizard",
     )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="remove the app, shortcuts and data from every standard location",
+    )
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser")
     parser.add_argument("--port", type=int, help="setup wizard port")
     parser.add_argument(
@@ -162,6 +168,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.data_dir:
         os.environ["BOOK_MY_DATE_HOME"] = str(Path(args.data_dir).expanduser())
+
+    if args.uninstall:
+        if not UNINSTALLER.exists():
+            print(f"Uninstaller not found at {UNINSTALLER}")
+            return 1
+        command = [
+            sys.executable,
+            str(UNINSTALLER),
+            "--all",
+            "--purge",
+            "--yes",
+            "--force",
+        ]
+        if args.data_dir:
+            command.extend(["--data-dir", args.data_dir])
+        try:
+            return subprocess.call(command)
+        except OSError as exc:
+            print(f"Could not uninstall Book My Date: {exc}")
+            return 1
 
     root = install_root()
     if not args.setup and _launch_installed(root):
