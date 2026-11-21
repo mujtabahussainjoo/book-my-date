@@ -20,12 +20,12 @@ pipeline {
             defaultValue: true,
             description: 'Run SonarQube analysis when SONAR_HOST_URL is configured.'
         )
-        stringParam(
+        string(
             name: 'SONAR_HOST_URL',
             defaultValue: '',
             description: 'SonarQube base URL. Leave blank to skip the SonarQube stage.'
         )
-        stringParam(
+        string(
             name: 'SONAR_CREDENTIALS_ID',
             defaultValue: 'sonar-token',
             description: 'Jenkins string credential containing the SonarQube token.'
